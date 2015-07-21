@@ -77,57 +77,37 @@ Standard MIT license
     
 my $bucket_size = 1800;
 
-# Check the similarity of the moves done by both players.
-sub action_intersect {
+# Do the IP sets contain at least one shared address?
+sub ips_intersect {
     my ($set1, $set2) = @_;
-
-    # Player B had nothing to do: no information
-    return (0, 0) if !keys %{$set2};
-    # Player A was stalling; this will be handled in delay_intersect
-    return (0, 0) if $set1->{delay};
 
     my $count = 0;
     my $match = 0;
     for my $key (keys %{$set1}) {
+        # Ignore delay records
+        next if $key eq 'delay';
         $count += $set1->{$key};
         if ($set2->{$key}) {
-            $match = 1;
+            return 1;
         }
     }
 
-    if (!$match) {
-        # Both did some moves, and the sets of IP addresses were disjoint
-        # -> strong negative signal
-        return (0, $count)
-    } else {
-        # Both did some moves, and the sets of IP addresses had an
-        # intersection -> strong positive signal.
-        return ($count, 0)
-    }
+    return 0;
 }
 
-# Check the similarity of the decision to not move by both players.
-sub delay_intersect {
-    my ($set1, $set1_next, $set2) = @_;
+sub categorize_time_bucket {
+    my ($set) = @_;
+    my $count = keys %{$set};
+    my ($move, $stall, $idle) = (0, $set->{delay}, $count);
 
-    # Player B had nothing to do, no information
-    return (0, 0) if !keys %{$set2};
-    # Player A made a move; handled in action_intersect
-    return (0, 0) if !$set1->{delay};
-
-    # Both players were stalling -> weak positive signal
-    return (1, 0) if $set2->{delay};
-
-    # Player A was stalling, player B did a move. But Player A did a move
-    # in the very next time bucket. Assume this is just a time quantization
-    # issue -> no signal.
-    my ($next_intersects) = action_intersect $set1_next, $set2;
-    if ($next_intersects) {
-        return (0, 0);
+    if ($stall) {
+        $move = $count - 1;
+    } else {
+        $move = $count;
     }
 
-    # Player A was stalling, player B did a move -> weak negative signal.
-    return (0, 1);
+    my $index = ($move ? 0 : ($stall ? 1 : 2));
+    ($move, $stall, $idle, $index);
 }
 
 # Merge multiple hashes together. For duplicate keys, the output value
@@ -161,12 +141,9 @@ sub update_similarity {
 sub user_similarity {
     my ($user, $other) = @_;
 
-    my ($match_count, $mismatch_count) = (0, 0, 0);
-    my ($both_delay_count, $delay_mismatch_count) = (0, 0);
-
     # Starting score. Arbitrary, but should be low enough that cases with
     # only few samples will not be flagged for manual inspection.
-    my $similarity = 0.25;
+    my $similarity = 0;
     # Fairly low starting weight; we'd expect hundreds of samples for
     # interesting cases.
     my $similarity_weight = 20;
@@ -175,42 +152,39 @@ sub user_similarity {
 
     for my $bucket (sort { $a cmp $b } keys %{$user->[1]}) {
         my $user_ips = $user->[1]{$bucket};
-        my $user_next = $user->[1]{$bucket + $bucket_size};
         my $other_ips = $other->[1]{$bucket};
+
+        my $user_next = $user->[1]{$bucket + $bucket_size};
+        my $user_prev = $user->[1]{$bucket - $bucket_size};
+
         my $other_prev = $other->[1]{$bucket - $bucket_size};
         my $other_next = $other->[1]{$bucket + $bucket_size};
-        my ($eq, $mismatch) = action_intersect $user_ips, merge($other_prev, $other_ips, $other_next);
-        my ($delay_both, $delay_one) = delay_intersect $user_ips, $user_next, $other_ips;
 
-        ($similarity, $similarity_weight) = update_similarity
-            $similarity, $similarity_weight, 10,
-            # If both players are moving at the same time and place
-            # after a long delay, treat that as a signal.
-            ($eq ? $delay_both_run + $eq : $eq),
-            $mismatch;
-        ($similarity, $similarity_weight) = update_similarity
-            $similarity, $similarity_weight, 1, $delay_both, $delay_one;
+        $user_ips = merge($user_ips, $user_next, $user_prev);
+        $other_ips = merge($other_ips, $other_next, $other_prev);
+            
+        my ($user_moved, $user_delayed, $user_idle, $user_index) = categorize_time_bucket $user_ips;
+        my ($other_moved, $other_delayed, $other_idle, $other_index) = categorize_time_bucket $other_ips;
+        my $ips_intersect = ips_intersect merge($user_ips, $user_next, $user_prev), merge($other_ips, $other_next, $other_prev);
+        my $move_value = $ips_intersect ? 10 + $delay_both_run : -10;
+        my @scoring = ([$move_value, -5, 0],
+                       [-1, 1, 0],
+                       [0, 0, 0]);
+        my $score = $scoring[$user_index][$other_index];
+        
+        $similarity += $score;
+        $similarity_weight += abs $score;
 
-        if ($delay_both) {
+        if ($user_delayed and $other_delayed) {
             $delay_both_run++;
         } else {
             $delay_both_run = 0;
         }
-
-        $both_delay_count += $delay_both;
-        $delay_mismatch_count += $delay_one;
-
-        $match_count += $eq;
-        $mismatch_count += $mismatch;
     }
 
-    return [ $similarity,
+    return [ ($similarity / $similarity_weight) / 2 + 0.5, # 0-1 range
              $user->[0],
-             $other->[0],
-             $match_count,
-             $mismatch_count,
-             $both_delay_count,
-             $delay_mismatch_count ];
+             $other->[0] ];
 }
 
 sub user_time_buckets {
@@ -308,7 +282,7 @@ sub analyze {
     
     if ($pairs_out) {
         print $pairs_out "similarity,user_a,user_b,match,mismatch,delay_match,delay_mismatch\n";
-        for my $score (sort { $a->[0] <=> $b->[0] } @scores) {
+        for my $score (sort { $b->[0] <=> $a->[0] } @scores) {
             print $pairs_out join ",", @{$score};
             print $pairs_out "\n";
         }
